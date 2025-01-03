@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from app.scraper import scrape_product_data
+from typing import List
+from app.scraper import AsyncProductScraper
 
 # Initialize the FastAPI app
 app = FastAPI()
@@ -13,12 +14,10 @@ class ASINRequest(BaseModel):
 @app.post("/scrape")
 async def scrape(asin_request: ASINRequest):
     """Scrape product data from Amazon using the provided ASIN."""
-    asin = asin_request.asin  # Get the ASIN from the request
-
-    # Call the scrape function from scraper.py
     try:
-        product_data = await scrape_product_data(asin)
-        return product_data
+        scraper = AsyncProductScraper()
+        product_data = await scraper.scrape_products([asin_request.asin])
+        return product_data[0]  # Return first result since we're only sending one ASIN
     except Exception as e:
         # Return an error if scraping fails
         raise HTTPException(status_code=500, detail=f"Error scraping product data: {str(e)}")
