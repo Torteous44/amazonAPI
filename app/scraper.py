@@ -1,19 +1,25 @@
 import aiohttp
 import asyncio
 from lxml import html
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from datetime import datetime
-import random
-import requests
+import logging
+from collections import deque
+import cachetools
 from aiohttp import ClientTimeout, TCPConnector
-from aiohttp_socks import ProxyConnector
-from app.utils import get_amazon_url
+import requests
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class ProxyRotator:
     def __init__(self):
-        self.proxies = self.get_free_proxies()
-        self.current = 0
-        
+        self.proxies = deque(self.get_free_proxies())
+        self.failed_proxies = set()
+        self.min_proxies = 10
+        logger.info(f"Initialized ProxyRotator with {len(self.proxies)} proxies")
+    
     def get_free_proxies(self) -> List[str]:
         proxies = []
         sources = [
@@ -26,61 +32,143 @@ class ProxyRotator:
             try:
                 response = requests.get(source)
                 if response.status_code == 200:
-                    proxies.extend([f"http://{proxy.strip()}" for proxy in response.text.splitlines() if proxy.strip()])
-            except:
-                continue
+                    new_proxies = [f"http://{proxy.strip()}" for proxy in response.text.splitlines() if proxy.strip()]
+                    proxies.extend(new_proxies)
+                    logger.info(f"Fetched {len(new_proxies)} proxies from {source}")
+            except Exception as e:
+                logger.error(f"Error fetching proxies from {source}: {e}")
                 
-        return list(set(proxies))  # Remove duplicates
+        return list(set(proxies))
+    
+    def get_proxy(self) -> Optional[str]:
+        if len(self.proxies) < self.min_proxies:
+            logger.info("Refreshing proxy list...")
+            self.proxies.extend(self.get_free_proxies())
         
-    def get_proxy(self) -> str:
-        if not self.proxies:
-            self.proxies = self.get_free_proxies()
-        proxy = self.proxies[self.current]
-        self.current = (self.current + 1) % len(self.proxies)
-        return proxy
+        while self.proxies:
+            proxy = self.proxies[0]
+            self.proxies.rotate(-1)
+            if proxy not in self.failed_proxies:
+                return proxy
+        return None
+    
+    def mark_failed(self, proxy: str):
+        if proxy in self.proxies:
+            self.proxies.remove(proxy)
+            self.failed_proxies.add(proxy)
+            logger.warning(f"Marked proxy as failed: {proxy}")
 
 class AsyncProductScraper:
-    def __init__(self, max_concurrent: int = 20):
+    def __init__(self, max_concurrent: int = 20, cache_ttl: int = 3600):
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.timeout = ClientTimeout(total=30)
         self.proxy_rotator = ProxyRotator()
-        self.headers = {
+        self.session = None
+        self.cache = cachetools.TTLCache(maxsize=1000, ttl=cache_ttl)
+        logger.info(f"Initialized AsyncProductScraper with {max_concurrent} concurrent connections")
+
+    async def __aenter__(self):
+        """Context manager entry"""
+        await self.get_session()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit"""
+        if self.session:
+            await self.session.close()
+            self.session = None
+
+    async def get_session(self):
+        if not self.session or self.session.closed:
+            connector = TCPConnector(limit=100, force_close=True, enable_cleanup_closed=True)
+            self.session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=self.timeout,
+                headers=self.get_headers()
+            )
+            logger.info("Created new aiohttp session")
+        return self.session
+
+    def get_headers(self):
+        return {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
         }
 
     async def scrape_products(self, asins: List[str]) -> List[Dict[Any, Any]]:
-        connector = TCPConnector(limit=100, force_close=True)
-        async with aiohttp.ClientSession(connector=connector, timeout=self.timeout, headers=self.headers) as session:
+        try:
+            session = await self.get_session()
             tasks = [self._scrape_with_semaphore(asin, session) for asin in asins]
-            return await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            return [r for r in results if not isinstance(r, Exception)]
+        finally:
+            if self.session:
+                await self.session.close()
+                self.session = None
 
     async def _scrape_with_semaphore(self, asin: str, session) -> Dict[Any, Any]:
         async with self.semaphore:
+            if asin in self.cache:
+                logger.info(f"Cache hit for ASIN: {asin}")
+                return self.cache[asin]
+
+            for retry in range(3):
+                try:
+                    data = await self._scrape_single_product(asin, session)
+                    if data and 'error' not in data:
+                        self.cache[asin] = data
+                        return data
+                except Exception as e:
+                    logger.warning(f"Attempt {retry + 1} failed for ASIN {asin}: {str(e)}")
+                    if retry == 2:
+                        return {"asin": asin, "error": str(e)}
+                    await asyncio.sleep(1 * (retry + 1))
+            
+            return {"asin": asin, "error": "Max retries exceeded"}
+
+    async def _scrape_single_product(self, asin: str, session) -> Dict[Any, Any]:
+        url = f"https://www.amazon.com/dp/{asin}"
+        async with session.get(url) as response:
+            if response.status != 200:
+                raise Exception(f"Status {response.status}")
+            
+            content = await response.text()
+            tree = html.fromstring(content)
+            
+            # Parallel extraction with better error handling
+            extraction_tasks = await asyncio.gather(
+                self._extract_with_retry(self._extract_price, tree),
+                self._extract_with_retry(self._extract_rating, tree),
+                self._extract_with_retry(self._extract_total_reviews, tree),
+                self._extract_with_retry(self._extract_bullets, tree),
+                self._extract_with_retry(self._extract_reviews, tree),
+                self._extract_with_retry(self._extract_customers_say, tree),
+                self._extract_with_retry(self._extract_sentiments, tree),
+                return_exceptions=True
+            )
+            
+            return {
+                "asin": asin,
+                "price": extraction_tasks[0],
+                "average_rating": extraction_tasks[1],
+                "total_reviews": extraction_tasks[2],
+                "feature_bullets": extraction_tasks[3],
+                "reviews": extraction_tasks[4],
+                "customers_say": extraction_tasks[5],
+                "customer_sentiments": extraction_tasks[6]
+            }
+
+    async def _extract_with_retry(self, extract_func, tree, max_retries=2):
+        """Wrapper for extraction functions with retry logic"""
+        for attempt in range(max_retries):
             try:
-                url = get_amazon_url(asin)
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        return {"error": f"Status {response.status}", "asin": asin}
-                    
-                    content = await response.text()
-                    tree = html.fromstring(content)
-                    
-                    data = {"asin": asin}
-                    data.update({
-                        "price": await self._extract_price(tree),
-                        "average_rating": await self._extract_rating(tree),
-                        "total_reviews": await self._extract_total_reviews(tree),
-                        "feature_bullets": await self._extract_bullets(tree),
-                        "reviews": await self._extract_reviews(tree),
-                        "customers_say": await self._extract_customers_say(tree),
-                        "customer_sentiments": await self._extract_sentiments(tree)
-                    })
-                    return data
+                return await extract_func(tree)
             except Exception as e:
-                print(f"Error scraping {asin}: {str(e)}")
-                return {"asin": asin, "error": str(e)}
+                if attempt == max_retries - 1:
+                    logger.error(f"Extraction failed: {str(e)}")
+                    return "Not Available"
+                await asyncio.sleep(0.1)
 
     async def _extract_price(self, tree) -> str:
         price_selectors = [

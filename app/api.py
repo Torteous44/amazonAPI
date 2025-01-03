@@ -15,10 +15,9 @@ class ASINRequest(BaseModel):
 async def scrape(asin_request: ASINRequest):
     """Scrape product data from Amazon using the provided ASIN."""
     try:
-        scraper = AsyncProductScraper()
-        product_data = await scraper.scrape_products([asin_request.asin])
-        return product_data[0]  # Return first result since we're only sending one ASIN
+        async with AsyncProductScraper() as scraper:
+            product_data = await scraper.scrape_products([asin_request.asin])
+            return product_data[0]  # Return first result since we're only sending one ASIN
     except Exception as e:
-        # Return an error if scraping fails
         raise HTTPException(status_code=500, detail=f"Error scraping product data: {str(e)}")
 
